@@ -1,0 +1,6 @@
+# DVC ignore
+/tmp
+.env
+__pycache__
+*.pyc
+.pytest_cache
