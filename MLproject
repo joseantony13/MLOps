@@ -1,0 +1,101 @@
+# MLproject — MLflow Projects definition
+#
+# Allows this repo to be run as a reproducible MLflow Project:
+#
+#   mlflow run . -e train
+#   mlflow run . -e full_pipeline
+#   mlflow run . -e evaluate -P model_path=models/model.joblib
+#
+# Or run from a remote Git repo:
+#   mlflow run https://github.com/your-username/mlops-pipeline.git -e full_pipeline
+#
+# Docs: https://mlflow.org/docs/latest/projects.html
+
+name: mlops-pipeline
+
+# Use a conda or pip environment
+python_env: python_env.yaml
+
+entry_points:
+
+  # ── 1. Data Ingestion ───────────────────────────────────────────────────────
+  ingest:
+    parameters:
+      raw_path:
+        type: str
+        default: "data/raw/dataset.csv"
+    command: "python src/data_ingestion.py"
+
+  # ── 2. Preprocessing ────────────────────────────────────────────────────────
+  preprocess:
+    parameters:
+      raw_path:
+        type: str
+        default: "data/raw/dataset.csv"
+      processed_path:
+        type: str
+        default: "data/processed/"
+      test_size:
+        type: float
+        default: 0.2
+    command: "python src/data_preprocessing.py"
+
+  # ── 3. Training ─────────────────────────────────────────────────────────────
+  train:
+    parameters:
+      n_estimators:
+        type: int
+        default: 100
+      max_depth:
+        type: int
+        default: 10
+      min_samples_split:
+        type: int
+        default: 5
+      min_samples_leaf:
+        type: int
+        default: 2
+      cv_folds:
+        type: int
+        default: 5
+      experiment_name:
+        type: str
+        default: "mlops-pipeline"
+    command: >
+      python src/train.py
+
+  # ── 4. Evaluation ───────────────────────────────────────────────────────────
+  evaluate:
+    parameters:
+      model_path:
+        type: str
+        default: "models/model.joblib"
+      f1_threshold:
+        type: float
+        default: 0.80
+    command: "python src/evaluate.py"
+
+  # ── 5. Inference (CLI) ──────────────────────────────────────────────────────
+  predict:
+    parameters:
+      input_json:
+        type: str
+        default: ""
+      batch_csv:
+        type: str
+        default: ""
+      output_csv:
+        type: str
+        default: "predictions.csv"
+    command: >
+      python src/predict.py
+      --batch {batch_csv}
+      --output {output_csv}
+
+  # ── 6. Full Pipeline (all stages via DVC) ───────────────────────────────────
+  full_pipeline:
+    parameters:
+      force:
+        type: str
+        default: ""
+    command: "dvc repro {force}"
