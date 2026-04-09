@@ -1,0 +1,52 @@
+# ─── Stage 1: Builder ────────────────────────────────────────────────────────
+FROM python:3.11-slim AS builder
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY api/requirements.txt .
+RUN pip install --upgrade pip && \
+    pip install --prefix=/install -r requirements.txt
+
+# ─── Stage 2: Runtime ────────────────────────────────────────────────────────
+FROM python:3.11-slim AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# Copy only installed packages from builder
+COPY --from=builder /install /usr/local
+
+WORKDIR /app
+
+# Copy application code
+COPY api/app.py .
+
+# Non-root user
+RUN addgroup --system mlops && adduser --system --ingroup mlops mlops
+
+# Create expected model/data directories
+RUN mkdir -p models data/processed && chown -R mlops:mlops /app
+USER mlops
+
+# Runtime environment variables (override via Kubernetes ConfigMap / Secret)
+ENV MLFLOW_TRACKING_URI=http://mlflow-server:5000 \
+    REGISTERED_MODEL_NAME=production-classifier \
+    MODEL_STAGE=Production \
+    MODEL_PATH=models/model.joblib \
+    PREPROCESSOR_PATH=data/processed/preprocessor.joblib
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", \
+     "--workers", "2", "--log-level", "info"]
