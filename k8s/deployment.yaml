@@ -1,0 +1,151 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mlops-model-api
+  namespace: mlops
+  labels:
+    app: mlops-model-api
+    version: "1.0.0"
+    component: inference
+  annotations:
+    deployment.kubernetes.io/description: "MLOps Model Inference API"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mlops-model-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: mlops-model-api
+        version: "1.0.0"
+    spec:
+      # ── Security Context ──────────────────────────────────────────────────
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+
+      # ── Init Container: pull model artifacts ─────────────────────────────
+      initContainers:
+        - name: model-downloader
+          image: amazon/aws-cli:latest
+          command:
+            - sh
+            - -c
+            - |
+              aws s3 cp s3://${S3_BUCKET}/models/model.joblib /models/model.joblib
+              aws s3 cp s3://${S3_BUCKET}/preprocessor.joblib /data/processed/preprocessor.joblib
+          env:
+            - name: S3_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: mlops-config
+                  key: s3_bucket
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: mlops-secrets
+                  key: aws_access_key_id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: mlops-secrets
+                  key: aws_secret_access_key
+          volumeMounts:
+            - name: model-storage
+              mountPath: /models
+            - name: data-storage
+              mountPath: /data/processed
+
+      # ── Main Container ────────────────────────────────────────────────────
+      containers:
+        - name: api
+          image: your-registry/mlops-model-api:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+              name: http
+              protocol: TCP
+
+          # ── Environment ─────────────────────────────────────────────────
+          env:
+            - name: MLFLOW_TRACKING_URI
+              valueFrom:
+                configMapKeyRef:
+                  name: mlops-config
+                  key: mlflow_tracking_uri
+            - name: REGISTERED_MODEL_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: mlops-config
+                  key: registered_model_name
+            - name: MODEL_STAGE
+              valueFrom:
+                configMapKeyRef:
+                  name: mlops-config
+                  key: model_stage
+            - name: MODEL_PATH
+              value: "/models/model.joblib"
+            - name: PREPROCESSOR_PATH
+              value: "/data/processed/preprocessor.joblib"
+
+          # ── Volume Mounts ────────────────────────────────────────────────
+          volumeMounts:
+            - name: model-storage
+              mountPath: /models
+              readOnly: true
+            - name: data-storage
+              mountPath: /data/processed
+              readOnly: true
+
+          # ── Probes ───────────────────────────────────────────────────────
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 3
+            successThreshold: 1
+            failureThreshold: 3
+
+          # ── Resources ────────────────────────────────────────────────────
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+
+          # ── Security ─────────────────────────────────────────────────────
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+      # ── Volumes ───────────────────────────────────────────────────────────
+      volumes:
+        - name: model-storage
+          emptyDir: {}
+        - name: data-storage
+          emptyDir: {}
+
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30

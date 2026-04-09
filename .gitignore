@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.env
+
+# DVC (tracked outputs — not stored in Git)
+/data/raw/
+/data/processed/
+/models/
+/metrics/
+
+# MLflow
+mlruns/
+
+# Testing
+.pytest_cache/
+.coverage
+reports/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Secrets
+*.pem
+*.key
+secrets.yaml

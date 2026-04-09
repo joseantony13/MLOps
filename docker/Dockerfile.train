@@ -1,0 +1,38 @@
+# ─── Stage 1: Base Python image ──────────────────────────────────────────────
+FROM python:3.11-slim AS base
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /app
+
+# System dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# ─── Stage 2: Dependencies ───────────────────────────────────────────────────
+FROM base AS dependencies
+COPY requirements.txt .
+RUN pip install --upgrade pip && pip install -r requirements.txt
+
+# ─── Stage 3: Training image ─────────────────────────────────────────────────
+FROM dependencies AS trainer
+
+WORKDIR /app
+COPY . .
+
+# Create directories that DVC / MLflow expect
+RUN mkdir -p data/raw data/processed models metrics
+
+# Non-root user for security
+RUN addgroup --system mlops && adduser --system --ingroup mlops mlops
+RUN chown -R mlops:mlops /app
+USER mlops
+
+# Entry point runs the full DVC pipeline
+ENTRYPOINT ["dvc", "repro"]

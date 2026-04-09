@@ -1,0 +1,254 @@
+// Jenkinsfile — End-to-End MLOps CI/CD Pipeline
+// Stages: Checkout → Lint/Test → DVC Pull → Train → Evaluate → Build & Push → Deploy
+
+pipeline {
+    agent {
+        kubernetes {
+            yaml """
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    app: mlops-pipeline
+spec:
+  containers:
+    - name: python
+      image: python:3.11-slim
+      command: ['cat']
+      tty: true
+      resources:
+        requests:
+          cpu: "1"
+          memory: "2Gi"
+        limits:
+          cpu: "2"
+          memory: "4Gi"
+    - name: docker
+      image: docker:24-dind
+      securityContext:
+        privileged: true
+      volumeMounts:
+        - name: docker-storage
+          mountPath: /var/lib/docker
+    - name: kubectl
+      image: bitnami/kubectl:latest
+      command: ['cat']
+      tty: true
+  volumes:
+    - name: docker-storage
+      emptyDir: {}
+"""
+        }
+    }
+
+    environment {
+        REGISTRY         = credentials('docker-registry-url')
+        IMAGE_NAME       = "${REGISTRY}/mlops-model-api"
+        IMAGE_TAG        = "${GIT_COMMIT[0..7]}"
+        MLFLOW_TRACKING_URI = credentials('mlflow-tracking-uri')
+        DVC_REMOTE_URL   = credentials('dvc-remote-url')
+        KUBECONFIG_CRED  = credentials('kubeconfig')
+        NAMESPACE        = 'mlops'
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 90, unit: 'MINUTES')
+        disableConcurrentBuilds()
+    }
+
+    triggers {
+        // Retrain daily at 2 AM or on every push to main/develop
+        cron('0 2 * * *')
+        githubPush()
+    }
+
+    stages {
+
+        // ── 1. Checkout ──────────────────────────────────────────────────────
+        stage('Checkout') {
+            steps {
+                container('python') {
+                    checkout scm
+                    sh 'git log --oneline -5'
+                }
+            }
+        }
+
+        // ── 2. Install Dependencies ──────────────────────────────────────────
+        stage('Install Dependencies') {
+            steps {
+                container('python') {
+                    sh '''
+                        pip install --upgrade pip --quiet
+                        pip install -r requirements.txt --quiet
+                        pip install pytest flake8 --quiet
+                    '''
+                }
+            }
+        }
+
+        // ── 3. Lint & Unit Tests ─────────────────────────────────────────────
+        stage('Lint & Test') {
+            parallel {
+                stage('Lint') {
+                    steps {
+                        container('python') {
+                            sh 'flake8 src/ api/ --max-line-length=120 --ignore=E501,W503'
+                        }
+                    }
+                }
+                stage('Unit Tests') {
+                    steps {
+                        container('python') {
+                            sh '''
+                                pytest tests/ -v \
+                                    --junitxml=reports/junit.xml \
+                                    --cov=src \
+                                    --cov-report=xml:reports/coverage.xml \
+                                    --cov-fail-under=70
+                            '''
+                        }
+                    }
+                    post {
+                        always {
+                            junit 'reports/junit.xml'
+                            publishCoverage adapters: [coberturaAdapter('reports/coverage.xml')]
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── 4. DVC Data Pull ─────────────────────────────────────────────────
+        stage('DVC Pull') {
+            steps {
+                container('python') {
+                    withCredentials([string(credentialsId: 'dvc-remote-access-key',
+                                           variable: 'DVC_ACCESS_KEY')]) {
+                        sh '''
+                            git config --global user.email "ci@mlops-pipeline.local"
+                            git config --global user.name "Jenkins CI"
+                            dvc remote modify myremote access_key_id ${DVC_ACCESS_KEY}
+                            dvc pull --run-cache -f || echo "DVC pull failed, will regenerate"
+                        '''
+                    }
+                }
+            }
+        }
+
+        // ── 5. Data Pipeline + Training ──────────────────────────────────────
+        stage('Train Pipeline') {
+            steps {
+                container('python') {
+                    sh '''
+                        export MLFLOW_TRACKING_URI=${MLFLOW_TRACKING_URI}
+                        dvc repro --force
+                        dvc push
+                    '''
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'metrics/scores.json', fingerprint: true
+                }
+            }
+        }
+
+        // ── 6. Quality Gate ──────────────────────────────────────────────────
+        stage('Quality Gate') {
+            steps {
+                container('python') {
+                    script {
+                        def scores = readJSON file: 'metrics/scores.json'
+                        def f1 = scores['test_f1_weighted'].toDouble()
+                        echo "Test F1 (weighted): ${f1}"
+                        if (f1 < 0.80) {
+                            error("Quality gate FAILED: test_f1_weighted=${f1} < 0.80. Aborting deployment.")
+                        }
+                        echo "Quality gate PASSED."
+                    }
+                }
+            }
+        }
+
+        // ── 7. Build & Push Docker Image ─────────────────────────────────────
+        stage('Build & Push Image') {
+            when { branch pattern: 'main|release/.*', comparator: 'REGEXP' }
+            steps {
+                container('docker') {
+                    withCredentials([usernamePassword(
+                            credentialsId: 'docker-registry-credentials',
+                            usernameVariable: 'DOCKER_USER',
+                            passwordVariable: 'DOCKER_PASS')]) {
+                        sh '''
+                            echo "$DOCKER_PASS" | docker login ${REGISTRY} -u "$DOCKER_USER" --password-stdin
+                            docker build \
+                                -f docker/Dockerfile.api \
+                                -t ${IMAGE_NAME}:${IMAGE_TAG} \
+                                -t ${IMAGE_NAME}:latest \
+                                --label "git.commit=${GIT_COMMIT}" \
+                                --label "build.number=${BUILD_NUMBER}" \
+                                .
+                            docker push ${IMAGE_NAME}:${IMAGE_TAG}
+                            docker push ${IMAGE_NAME}:latest
+                        '''
+                    }
+                }
+            }
+        }
+
+        // ── 8. Deploy to Kubernetes ──────────────────────────────────────────
+        stage('Deploy to Kubernetes') {
+            when { branch 'main' }
+            steps {
+                container('kubectl') {
+                    withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+                        sh '''
+                            export KUBECONFIG=${KUBECONFIG}
+                            # Update image tag in deployment
+                            kubectl set image deployment/mlops-model-api \
+                                api=${IMAGE_NAME}:${IMAGE_TAG} \
+                                -n ${NAMESPACE}
+                            # Wait for rollout
+                            kubectl rollout status deployment/mlops-model-api \
+                                -n ${NAMESPACE} \
+                                --timeout=300s
+                            # Verify pods are running
+                            kubectl get pods -n ${NAMESPACE} -l app=mlops-model-api
+                        '''
+                    }
+                }
+            }
+        }
+
+        // ── 9. Smoke Test ────────────────────────────────────────────────────
+        stage('Smoke Test') {
+            when { branch 'main' }
+            steps {
+                container('python') {
+                    sh '''
+                        pip install httpx --quiet
+                        python tests/smoke_test.py
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            cleanWs()
+        }
+        success {
+            echo "Pipeline completed successfully. Build #${BUILD_NUMBER}"
+            // slackSend channel: '#mlops-alerts', color: 'good',
+            //     message: "MLOps pipeline #${BUILD_NUMBER} SUCCESS (${IMAGE_TAG})"
+        }
+        failure {
+            echo "Pipeline FAILED. Check logs for details."
+            // slackSend channel: '#mlops-alerts', color: 'danger',
+            //     message: "MLOps pipeline #${BUILD_NUMBER} FAILED"
+        }
+    }
+}
