@@ -1,0 +1,111 @@
+version: "3.9"
+
+# ─── MLOps Local Development Stack ───────────────────────────────────────────
+# Usage:
+#   docker-compose up -d          # Start all services
+#   docker-compose logs -f api    # Tail API logs
+#   docker-compose down -v        # Tear down and remove volumes
+
+services:
+
+  # ── MLflow Tracking Server ─────────────────────────────────────────────────
+  mlflow-server:
+    image: ghcr.io/mlflow/mlflow:v2.10.0
+    container_name: mlflow-server
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow-data:/mlflow
+    environment:
+      - MLFLOW_BACKEND_STORE_URI=sqlite:///mlflow/mlflow.db
+      - MLFLOW_DEFAULT_ARTIFACT_ROOT=/mlflow/artifacts
+    command: >
+      mlflow server
+        --backend-store-uri sqlite:///mlflow/mlflow.db
+        --default-artifact-root /mlflow/artifacts
+        --host 0.0.0.0
+        --port 5000
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - mlops-net
+
+  # ── Training Container ─────────────────────────────────────────────────────
+  trainer:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.train
+    container_name: mlops-trainer
+    depends_on:
+      mlflow-server:
+        condition: service_healthy
+    environment:
+      - MLFLOW_TRACKING_URI=http://mlflow-server:5000
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./metrics:/app/metrics
+      - dvc-cache:/app/.dvc/cache
+    networks:
+      - mlops-net
+    profiles:
+      - train   # Only starts with: docker-compose --profile train up
+
+  # ── Inference API ──────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    container_name: mlops-api
+    ports:
+      - "8000:8000"
+    depends_on:
+      mlflow-server:
+        condition: service_healthy
+    environment:
+      - MLFLOW_TRACKING_URI=http://mlflow-server:5000
+      - REGISTERED_MODEL_NAME=production-classifier
+      - MODEL_STAGE=Production
+      - MODEL_PATH=/models/model.joblib
+      - PREPROCESSOR_PATH=/data/processed/preprocessor.joblib
+    volumes:
+      - ./models:/models:ro
+      - ./data/processed:/data/processed:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - mlops-net
+
+  # ── Jenkins ────────────────────────────────────────────────────────────────
+  jenkins:
+    image: jenkins/jenkins:lts-jdk17
+    container_name: mlops-jenkins
+    ports:
+      - "8080:8080"
+      - "50000:50000"
+    volumes:
+      - jenkins-data:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock  # Docker-in-Docker
+    environment:
+      - JAVA_OPTS=-Djenkins.install.runSetupWizard=false
+    networks:
+      - mlops-net
+    profiles:
+      - ci   # Only starts with: docker-compose --profile ci up
+
+# ── Volumes ────────────────────────────────────────────────────────────────────
+volumes:
+  mlflow-data:
+  dvc-cache:
+  jenkins-data:
+
+# ── Networks ───────────────────────────────────────────────────────────────────
+networks:
+  mlops-net:
+    driver: bridge
